@@ -1,0 +1,8 @@
+# Build artifacts
+/ges
+/.idea
+
+# Go build/test cache and vendor
+*.test
+*.out
+vendor/
