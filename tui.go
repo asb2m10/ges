@@ -262,8 +262,8 @@ func (m *tuiModel) loadFile() tea.Cmd {
 	}
 }
 
-// loadSpool reads the job's unified spool (gesmsgstart, stdout, stderr,
-// gesmsgend concatenated in that order, like `ges job <n>`) for the pager.
+// loadSpool reads the job's unified spool (sysmsg header, stdout, stderr,
+// sysmsg footer, in that order, like `ges job <n>`) for the pager.
 func (m *tuiModel) loadSpool() tea.Cmd {
 	return func() tea.Msg {
 		var buf bytes.Buffer

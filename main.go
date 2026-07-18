@@ -19,6 +19,7 @@ Usage:
   ges job <job-number>                    print a job's stdout
   ges kill <job-number>                   stop a running job
   ges purge <job-number>                  delete a job's spooled output
+  ges purge --tag <tag>                   delete every job tagged <tag>
   ges entry                               list registered entries
 `
 
@@ -64,8 +65,13 @@ func main() {
 		requireArg(args, "kill <job-number>")
 		err = w.cmdKill(args[0])
 	case "purge":
-		requireArg(args, "purge <job-number>")
-		err = w.cmdPurge(args[0])
+		requireArg(args, "purge <job-number> | purge --tag <tag>")
+		if args[0] == "--tag" {
+			requireArg(args[1:], "purge --tag <tag>")
+			err = w.cmdPurgeTag(args[1])
+		} else {
+			err = w.cmdPurge(args[0])
+		}
 	case "entry":
 		err = w.cmdEntry()
 	case "-h", "--help", "help":

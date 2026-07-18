@@ -48,8 +48,7 @@ The workspace root is `~/.local/ges/`.
 └── jobs/
     └── <job-number>-<entry-name>/   # spool directory for one job
         ├── spec                     # job metadata (see §6)
-        ├── gesmsgstart               # start-of-job message (see §6.1)
-        ├── gesmsgend                 # end-of-job message (see §6.2)
+        ├── sysmsg                   # start + end-of-job messages (see §6.1)
         ├── stdout                   # captured standard output
         └── stderr                   # captured standard error
 ```
@@ -83,9 +82,11 @@ The workspace root is `~/.local/ges/`.
 
 **Recognized directives:**
 
-| Directive          | Effect                                                                 |
-|--------------------|------------------------------------------------------------------------|
-| `entry-name <name>`| Overrides the registered entry name (instead of the script base name). |
+| Directive              | Effect                                                                       |
+|------------------------|-------------------------------------------------------------------------------|
+| `entry-name <name>`    | Overrides the registered entry name (instead of the script base name).       |
+| `tags <a,b,c>`         | Comma-separated tags. Copied onto every job submitted from this entry (§6), letting jobs be purged in bulk with `ges purge --tag <tag>` (§7). |
+| `dd <ddname>`          | Data definition: links a file named `<ddname>`, sitting alongside the script, into the job. Before the executable starts, `ges` sets an environment variable `DD_<DDNAME>` (`<ddname>` upper-cased, non-alphanumeric characters replaced with `_`) to the file's full (absolute) path. Repeatable — one `dd` directive per file. |
 
 Additional directives are stored in the entry `spec` for future use.
 
@@ -103,10 +104,14 @@ Example script header:
 ```sh
 ## ges
 ### entry-name job01
+### tags nightly,etl
+### dd myfile_example
 ```
 
 This registers the script under the entry name `job01` regardless of the
-script's own file name.
+script's own file name, tags every job submitted from it with `nightly` and
+`etl`, and — assuming a file named `myfile_example` sits next to the script —
+sets `DD_MYFILE_EXAMPLE` to that file's full path before the script runs.
 
 ## 6. Job spec file
 
@@ -117,8 +122,16 @@ The `spec` file records, at job creation time:
 
 - **pid** — the process id of the spawned job.
 - **btime** — the begin time (start timestamp) of the job.
+- **path** — the full (absolute) path of the executable/script being run,
+  resolved from the entry at submit time.
+- **tags** — comma-separated tags copied from the submitting entry's `tags`
+  directive (§5.1), if any. Absent when the entry has none.
 - **env** — the environment used to spawn the job (one `env=<KEY>=<VALUE>`
-  line per variable).
+  line per variable). This includes **`GES_SPOOL_DIR`**, which `ges` sets to
+  the job's own spool directory so the running script can locate it (e.g. to
+  drop extra artifacts alongside `stdout`/`stderr`) without rediscovering it,
+  and one **`DD_<DDNAME>`** variable per `dd` directive (§5.1) on the
+  submitting entry.
 
 Once the job's process exits, the supervisor rewrites `spec` to additionally
 record the end-of-job stats:
@@ -128,35 +141,45 @@ record the end-of-job stats:
 - **cpu_user** / **cpu_sys** — user/system CPU time consumed by the job.
 - **exit** — the process exit code.
 
-`spec` — not `gesmsgstart`/`gesmsgend` — is the single machine-parsable
-record of a job's lifecycle. It is the source of truth for reporting a job's
-PID, start time, and (once present) end-of-job stats; it is used to determine
-whether the job is still running (by checking whether the recorded PID is
-alive) and whether it has finished (by checking whether `exit` is present).
+`spec` — not `sysmsg` — is the single machine-parsable record of a job's
+lifecycle. It is the source of truth for reporting a job's PID, start time,
+and (once present) end-of-job stats; it is used to determine whether the job
+is still running (by checking whether the recorded PID is alive) and whether
+it has finished (by checking whether `exit` is present).
+
+`spec` also records **header_lines** — the number of leading lines in
+`sysmsg` that make up the start-of-job header (§6.1), written at the same
+time as the header, before the job's process is started. Any lines beyond
+`header_lines` in `sysmsg` are the end-of-job footer (§6.1), appended once
+the job finishes.
 
 > **Implementation note**: because a submitted job is detached and released,
 > nothing in the `ges submit` process remains alive to observe how the job
 > ends. To capture end-of-job data, `ges` re-execs itself as a hidden
 > `__runjob__` supervisor subcommand, which starts the target, writes `spec`
-> and `gesmsgstart`, blocks on the target via `Wait()`, then writes
-> `gesmsgend`. This supervisor process — not the target directly — is the one
-> detached from the terminal session.
+> and the `sysmsg` header, blocks on the target via `Wait()`, then appends
+> the `sysmsg` footer. This supervisor process — not the target directly —
+> is the one detached from the terminal session.
 
-### 6.1 Start-of-job message (`gesmsgstart`)
+### 6.1 System message (`sysmsg`)
 
-Written as soon as the job is spawned, as a **human-readable** banner page
-(not intended to be parsed back — see §6 for the parsable record). Like a
-JES2 job's banner page, it leads with the entry name rendered as large
-ASCII-art block letters (via `github.com/dimiro1/banner`), followed by the
-start time, the full (absolute) path of the executable being run, and the
-environment it was spawned with.
+A single **human-readable** file (not intended to be parsed back — see §6
+for the parsable record) holding both the start-of-job header and, once the
+job finishes, the end-of-job footer appended to it:
 
-### 6.2 End-of-job message (`gesmsgend`)
+- **Header** — written as soon as the job is spawned. Like a JES2 job's
+  banner page, it leads with the entry name rendered as large ASCII-art
+  block letters (via `github.com/common-nighthawk/go-figure`), followed by
+  the start time and the full (absolute) path of the executable being run.
+  Its line count is recorded in `spec` as `header_lines` (§6).
+- **Footer** — appended once the job's process exits: the end time,
+  wall-clock runtime, user/system CPU time consumed, and the process exit
+  code.
 
-Written once the job's process exits, as a **human-readable** footer (not
-intended to be parsed back — see §6 for the parsable record): the end time,
-wall-clock runtime, user/system CPU time consumed, and the process exit
-code.
+Because the footer is appended after `header_lines` is already fixed, a
+reader can always split `sysmsg` back into its header and footer (see §7's
+`ges job` for how the unified spool view uses this to interleave the
+executable's own output between them).
 
 ## 7. Commands
 
@@ -184,10 +207,11 @@ code.
 - Running vs. finished is determined from the `spec` file's PID.
 
 ### `ges job <job-number>`
-- Concatenates and prints the job's spooled output, in order: `gesmsgstart`,
-  `stdout`, `stderr` (only present when submitted with
-  `--use-stdout-stderr`), then `gesmsgend`. Missing files (e.g. `gesmsgend`
-  before the job finishes) are silently skipped.
+- Prints the job's unified spool view, in order: the `sysmsg` header (its
+  first `header_lines` lines, per `spec`), `stdout`, `stderr` (only present
+  when submitted with `--use-stdout-stderr`), then the rest of `sysmsg` —
+  the end-of-job footer. The footer is empty (nothing printed) before the
+  job finishes.
 
 ### `ges kill <job-number>`
 - Stops the job if it is still running (signals the recorded PID).
@@ -196,8 +220,15 @@ code.
 ### `ges purge <job-number>`
 - Deletes the spooled output/directory for the given job number.
 
+### `ges purge --tag <tag>`
+- Deletes the spooled output/directory of **every** job whose `tags` (§6)
+  includes `<tag>`, printing each purged job number. Prints an informative
+  message (no error) if no job matches.
+
 ### `ges entry`
-- Returns the list of currently registered entries (registered jobs/entries).
+- Returns the list of currently registered entries (registered jobs/entries),
+  each with its target path and, if configured, its `tags` and `dd`
+  directives (§5.1).
 
 ### 7.1 Interactive TUI (`ges`, no arguments)
 
@@ -205,18 +236,18 @@ Three nested screens, built on `charmbracelet/bubbletea` + `bubbles` +
 `lipgloss`:
 
 1. **Job list** — one line per job: job number, entry name, status
-   (`running (pid N)` or `done`), and return code (read from `gesmsgend`;
-   `-` if the job hasn't finished yet).
+   (`running (pid N)` or `done`), and return code (read from the `sysmsg`
+   footer; `-` if the job hasn't finished yet).
    - `Enter` — drill into that job's spooled files (screen 2).
    - `s` — open the pager (screen 3) directly on the job's **unified spool**
-     view: `gesmsgstart`, `stdout`, `stderr`, `gesmsgend` concatenated in that
-     order, same as `ges job <job-number>` (§7).
+     view: the `sysmsg` header, `stdout`, `stderr`, then the `sysmsg` footer,
+     same as `ges job <job-number>` (§7).
    - `Delete` — purge the selected job (deletes its spool directory, same as
      `ges purge`), then refreshes the list.
    - `q` / `Ctrl-C` — quit.
-2. **File list** — the job's spooled files (`spec`, `gesmsgstart`,
-   `gesmsgend`, `stdout`, `stderr`, …), **ordered by modification time,
-   ascending**, one file per line.
+2. **File list** — the job's spooled files (`spec`, `sysmsg`, `stdout`,
+   `stderr`, …), **ordered by modification time, ascending**, one file per
+   line.
    - `Enter` — open that single file in the pager (screen 3).
    - `Esc` / `Backspace` — back to the job list.
    - `q` / `Ctrl-C` — quit.
@@ -243,8 +274,8 @@ Three nested screens, built on `charmbracelet/bubbletea` + `bubbles` +
 - Language: **Go**.
 - Target platforms: **Linux** and **macOS**.
 - Dependencies:
-  - `github.com/dimiro1/banner` — JES2-style banner rendering in
-    `gesmsgstart`.
+  - `github.com/common-nighthawk/go-figure` — JES2-style banner rendering in
+    the `sysmsg` header.
   - `github.com/charmbracelet/bubbletea`, `github.com/charmbracelet/bubbles`,
     `github.com/charmbracelet/lipgloss` — the interactive TUI (§7.1).
   - Otherwise standard library only.

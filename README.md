@@ -109,6 +109,11 @@ from it. For example, to register the script under a custom entry name:
 ### entry-name nightly-backup
 ```
 
+## Examples
+
+See [`examples/`](examples/) for runnable scripts, including a `dd`
+directive example.
+
 ## Learn more
 
-See [`spec.md`](spec.md) for the full behavioral specification.
+See [`docs/spec.md`](docs/spec.md) for the full behavioral specification.

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -13,6 +14,7 @@ import (
 // share a single "stdout" file descriptor.
 func (w *Workspace) cmdSubmit(arg string, separateStreams bool) error {
 	var target, entryName string
+	var tags, dds []string
 	if isPathLike(arg) {
 		abs, err := filepath.Abs(arg)
 		if err != nil {
@@ -23,14 +25,19 @@ func (w *Workspace) cmdSubmit(arg string, separateStreams bool) error {
 		}
 		target = abs
 		// Inspect the script for a "## ges" configuration block; an
-		// "entry-name" directive overrides the registered entry name.
+		// "entry-name" directive overrides the registered entry name, and a
+		// "tags" directive is copied onto every job submitted from it.
 		cfg, err := parseEntryConfig(abs)
 		if err != nil {
 			return err
 		}
 		entryName = filepath.Base(arg)
-		if cfg != nil && cfg.Name != "" {
-			entryName = cfg.Name
+		if cfg != nil {
+			if cfg.Name != "" {
+				entryName = cfg.Name
+			}
+			tags = cfg.Tags
+			dds = cfg.DDs
 		}
 		if err := w.registerEntry(entryName, target, cfg); err != nil {
 			return err
@@ -46,6 +53,8 @@ func (w *Workspace) cmdSubmit(arg string, separateStreams bool) error {
 			return fmt.Errorf("cannot submit %q: %w", entryName, err)
 		}
 		target = resolved
+		tags = w.resolveEntryTags(entryName)
+		dds = w.resolveEntryDDs(entryName)
 	}
 
 	num, err := w.nextJobNumber()
@@ -66,12 +75,21 @@ func (w *Workspace) cmdSubmit(arg string, separateStreams bool) error {
 		streamFlag = "1"
 	}
 
+	// Each "dd" directive links a file of the same name sitting alongside the
+	// target script into the job's environment. Resolve the full paths now,
+	// while the target's directory is at hand, and hand them to the
+	// supervisor as "ddname=/full/path" pairs.
+	ddPairs := make([]string, len(dds))
+	for i, name := range dds {
+		ddPairs[i] = name + "=" + filepath.Join(filepath.Dir(target), name)
+	}
+
 	// Re-exec ges as the detached supervisor for this job: it starts the
-	// target, waits on it, and writes gesmsgstart/gesmsgend/spec. Running
+	// target, waits on it, and writes sysmsg/spec. Running
 	// the target directly here wouldn't let us observe its end-of-job
 	// exit code/CPU time without ges itself blocking on it, which would
 	// defeat the "submit returns immediately" contract.
-	cmd := exec.Command(self, runJobCmd, dir, target, streamFlag)
+	cmd := exec.Command(self, runJobCmd, dir, target, streamFlag, strings.Join(tags, ","), strings.Join(ddPairs, ","))
 	cmd.Stdin = nil
 	// Detach from the controlling terminal / session.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -103,8 +121,8 @@ func (w *Workspace) cmdJobs() error {
 	return nil
 }
 
-// cmdJob prints a job's spooled output: gesmsgstart, stdout, stderr (if kept
-// separate), then gesmsgend.
+// cmdJob prints a job's unified spool: the sysmsg header, stdout, stderr (if
+// kept separate), then the sysmsg footer.
 func (w *Workspace) cmdJob(arg string) error {
 	num, err := parseJobNumber(arg)
 	if err != nil {
@@ -155,6 +173,29 @@ func (w *Workspace) cmdPurge(arg string) error {
 	return nil
 }
 
+// cmdPurgeTag deletes the spooled output of every job carrying the given tag.
+func (w *Workspace) cmdPurgeTag(tag string) error {
+	jobs, err := w.listJobs()
+	if err != nil {
+		return err
+	}
+	purged := 0
+	for _, j := range jobs {
+		if !j.HasTag(tag) {
+			continue
+		}
+		if err := os.RemoveAll(j.Dir); err != nil {
+			return err
+		}
+		fmt.Printf("job %s purged\n", formatJobNumber(j.Number))
+		purged++
+	}
+	if purged == 0 {
+		fmt.Printf("no jobs tagged %q\n", tag)
+	}
+	return nil
+}
+
 // cmdEntry lists registered entries.
 func (w *Workspace) cmdEntry() error {
 	entries, err := os.ReadDir(w.EntryDir())
@@ -166,6 +207,12 @@ func (w *Workspace) cmdEntry() error {
 		suffix := ""
 		if e.IsDir() {
 			suffix = " [configured]"
+		}
+		if tags := w.resolveEntryTags(e.Name()); len(tags) > 0 {
+			suffix += "  tags=" + strings.Join(tags, ",")
+		}
+		if dds := w.resolveEntryDDs(e.Name()); len(dds) > 0 {
+			suffix += "  dd=" + strings.Join(dds, ",")
 		}
 		fmt.Printf("%-20s -> %s%s\n", e.Name(), target, suffix)
 	}

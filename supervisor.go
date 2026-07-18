@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,17 +18,21 @@ import (
 const runJobCmd = "__runjob__"
 
 // runJobSupervisor runs as the detached process for a job. It starts the
-// target executable, writes gesmsgstart/spec at launch, waits for it to
-// finish, and writes gesmsgend with the run's outcome. Splitting this out
-// from ges submit lets ges submit return immediately while still capturing
-// end-of-job stats (exit code, CPU time), since only a process that Wait()s
-// on the job can observe those.
+// target executable, writes the sysmsg header/spec at launch, waits for it to
+// finish, and appends the sysmsg footer with the run's outcome. Splitting
+// this out from ges submit lets ges submit return immediately while still
+// capturing end-of-job stats (exit code, CPU time), since only a process
+// that Wait()s on the job can observe those.
 func runJobSupervisor(args []string) {
-	if len(args) != 3 {
+	if len(args) != 5 {
 		os.Exit(2)
 	}
-	dir, target, separateFlag := args[0], args[1], args[2]
+	dir, target, separateFlag, tagsCSV, ddCSV := args[0], args[1], args[2], args[3], args[4]
 	separate := separateFlag == "1"
+	var tags []string
+	if tagsCSV != "" {
+		tags = splitTags(tagsCSV)
+	}
 
 	num, entry, err := parseJobDir(dir)
 	if err != nil {
@@ -41,8 +45,25 @@ func runJobSupervisor(args []string) {
 	}
 	defer stdout.Close()
 
+	// GES_SPOOL_DIR lets the job locate its own spool directory (e.g. to drop
+	// extra artifacts alongside stdout/stderr) without having to rediscover it.
+	env := append(os.Environ(), "GES_SPOOL_DIR="+dir)
+
+	// Each "ddname=/full/path" pair (from the entry's "dd" directives) becomes
+	// its own DD_<DDNAME> environment variable pointing at the linked file.
+	if ddCSV != "" {
+		for _, pair := range strings.Split(ddCSV, ",") {
+			name, path, ok := strings.Cut(pair, "=")
+			if !ok {
+				continue
+			}
+			env = append(env, ddEnvVar(name)+"="+path)
+		}
+	}
+
 	cmd := exec.Command(target)
 	cmd.Stdin = nil
+	cmd.Env = env
 	cmd.Stdout = stdout
 	if separate {
 		stderr, err := os.Create(filepath.Join(dir, "stderr"))
@@ -56,13 +77,16 @@ func runJobSupervisor(args []string) {
 	}
 
 	btime := time.Now()
-	writeJobStartMessage(dir, num, entry, btime, target, os.Environ())
+	headerLines, err := writeJobStartMessage(dir, num, entry, btime, target)
+	if err != nil {
+		os.Exit(1)
+	}
 
 	if err := cmd.Start(); err != nil {
 		os.Exit(1)
 	}
 
-	job := &Job{Number: num, Entry: entry, Dir: dir, PID: cmd.Process.Pid, BTime: btime, Env: os.Environ()}
+	job := &Job{Number: num, Entry: entry, Dir: dir, PID: cmd.Process.Pid, BTime: btime, Env: env, Path: target, HeaderLines: headerLines, Tags: tags}
 	_ = job.writeSpec()
 
 	_ = cmd.Wait()
@@ -98,48 +122,51 @@ func parseJobDir(dir string) (uint32, string, error) {
 	return num, base[sep+1:], nil
 }
 
-// writeJobStartMessage writes gesmsgstart, a human-readable banner page
-// documenting the job's start time, the full path of the executable, and the
-// environment it runs with. Like a JES2 job's banner page, it leads with the
-// entry name rendered as large ASCII-art block letters. This file is for
-// display only (`ges job`/TUI); the machine-parsable record lives in spec.
-func writeJobStartMessage(dir string, num uint32, entry string, start time.Time, path string, env []string) {
-	f, err := os.Create(filepath.Join(dir, "gesmsgstart"))
-	if err != nil {
-		return
-	}
-	defer f.Close()
+// writeJobStartMessage creates sysmsg with the job's start-of-job header: a
+// human-readable banner page (not intended to be parsed back — see §6 of
+// docs/spec.md for the parsable record). Like a JES2 job's banner page, it leads
+// with the entry name rendered as large ASCII-art block letters, followed by
+// the start time and the full path of the executable. Returns the number of
+// lines written, which the caller records in spec as header_lines so the
+// header can later be told apart from the end-of-job footer appended to the
+// same file.
+func writeJobStartMessage(dir string, num uint32, entry string, start time.Time, path string) (int, error) {
+	var buf bytes.Buffer
 
 	fig := figure.NewFigure(strings.ToUpper(fmt.Sprintf("Job %d", num)), "alligator2", false)
-    fig2 := figure.NewFigure(strings.ToUpper(entry), "alligator2", false)
+	fig2 := figure.NewFigure(strings.ToUpper(entry), "alligator2", false)
 
-	w := bufio.NewWriter(f)
-	w.WriteString(fig.String())
-	w.WriteString(fig2.String())
-	fmt.Fprintf(w, "Started: %s\n", start.Local().Format("2006-01-02 15:04:05 MST"))
-	fmt.Fprintf(w, "Command: %s\n", path)
-	for _, e := range env {
-		fmt.Fprintf(w, "  %s\n", e)
+	buf.WriteString(fig.String())
+	buf.WriteString(fig2.String())
+	fmt.Fprintf(&buf, "Started: %s\n", start.Local().Format("2006-01-02 15:04:05 MST"))
+	fmt.Fprintf(&buf, "Command: %s\n", path)
+	buf.WriteString(strings.Repeat("-", 72) + "\n")
+
+	f, err := os.Create(filepath.Join(dir, "sysmsg"))
+	if err != nil {
+		return 0, err
 	}
-	w.WriteString(strings.Repeat("-", 72) + "\n")
-	w.Flush()
+	defer f.Close()
+	if _, err := f.Write(buf.Bytes()); err != nil {
+		return 0, err
+	}
+	return strings.Count(buf.String(), "\n"), nil
 }
 
-// writeJobEndMessage writes gesmsgend, a human-readable footer documenting
-// the job's run time, CPU time used, and exit code. This file is for display
-// only (`ges job`/TUI); the machine-parsable record lives in spec.
+// writeJobEndMessage appends the end-of-job footer to sysmsg: a
+// human-readable summary (not intended to be parsed back — see §6 of
+// docs/spec.md for the parsable record) of the end time, wall-clock runtime,
+// user/system CPU time consumed, and the process exit code.
 func writeJobEndMessage(dir string, runtime, cpuUser, cpuSys time.Duration, exitCode int) {
-	f, err := os.Create(filepath.Join(dir, "gesmsgend"))
+	f, err := os.OpenFile(filepath.Join(dir, "sysmsg"), os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
 
-	w := bufio.NewWriter(f)
-	w.WriteString(strings.Repeat("-", 72) + "\n")
-	fmt.Fprintf(w, "Finished: %s\n", time.Now().Local().Format("2006-01-02 15:04:05 MST"))
-	fmt.Fprintf(w, "Runtime:  %s\n", runtime)
-	fmt.Fprintf(w, "CPU time: %s user, %s sys\n", cpuUser, cpuSys)
-	fmt.Fprintf(w, "Exit code: %d\n", exitCode)
-	w.Flush()
+	fmt.Fprintln(f, strings.Repeat("-", 72))
+	fmt.Fprintf(f, "Finished: %s\n", time.Now().Local().Format("2006-01-02 15:04:05 MST"))
+	fmt.Fprintf(f, "Runtime:  %s\n", runtime)
+	fmt.Fprintf(f, "CPU time: %s user, %s sys\n", cpuUser, cpuSys)
+	fmt.Fprintf(f, "Exit code: %d\n", exitCode)
 }

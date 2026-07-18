@@ -21,6 +21,17 @@ type Job struct {
 	PID    int
 	BTime  time.Time
 	Env    []string
+	// Path is the full (absolute) path of the executable/script that was run,
+	// resolved from the entry at submit time.
+	Path string
+	// HeaderLines is the number of leading lines in sysmsg that make up the
+	// start-of-job header, written before the job's process is started. Any
+	// lines beyond this in sysmsg are the end-of-job footer, appended once
+	// the job finishes. See writeSpool.
+	HeaderLines int
+	// Tags are copied from the submitting entry's "tags" directive at job
+	// creation time, letting jobs be purged in bulk by tag (cmdPurgeTag).
+	Tags []string
 
 	// End-of-job fields, populated once the job has finished (see
 	// writeJobEndMessage/writeSpec). Finished is false until then.
@@ -34,8 +45,8 @@ type Job struct {
 
 // writeSpec persists the job metadata (PID, btime, environment, and, once
 // available, end-of-job stats) to <dir>/spec. This is the single
-// machine-parsable record of a job's lifecycle; gesmsgstart/gesmsgend are
-// human-readable renderings for `ges job`/the TUI, not parsed back in.
+// machine-parsable record of a job's lifecycle; sysmsg is a human-readable
+// rendering for `ges job`/the TUI, not parsed back in.
 func (j *Job) writeSpec() error {
 	f, err := os.Create(filepath.Join(j.Dir, "spec"))
 	if err != nil {
@@ -46,6 +57,11 @@ func (j *Job) writeSpec() error {
 	w := bufio.NewWriter(f)
 	w.WriteString("pid=" + strconv.Itoa(j.PID) + "\n")
 	w.WriteString("btime=" + j.BTime.UTC().Format(time.RFC3339) + "\n")
+	w.WriteString("path=" + j.Path + "\n")
+	w.WriteString("header_lines=" + strconv.Itoa(j.HeaderLines) + "\n")
+	if len(j.Tags) > 0 {
+		w.WriteString("tags=" + strings.Join(j.Tags, ",") + "\n")
+	}
 	for _, e := range j.Env {
 		w.WriteString("env=" + e + "\n")
 	}
@@ -86,6 +102,12 @@ func loadJob(dir string) (*Job, error) {
 			j.PID, _ = strconv.Atoi(v)
 		case "btime":
 			j.BTime, _ = time.Parse(time.RFC3339, v)
+		case "path":
+			j.Path = v
+		case "header_lines":
+			j.HeaderLines, _ = strconv.Atoi(v)
+		case "tags":
+			j.Tags = splitTags(v)
 		case "env":
 			j.Env = append(j.Env, v)
 		case "etime":
@@ -104,15 +126,32 @@ func loadJob(dir string) (*Job, error) {
 	return j, nil
 }
 
-// spoolFileOrder is the order in which a job's spooled files are presented as
-// a unified view (`ges job <n>` and the TUI's unified spool view).
-var spoolFileOrder = []string{"gesmsgstart", "stdout", "stderr", "gesmsgend"}
-
-// writeSpool concatenates the job's spooled files (see spoolFileOrder) to w,
-// silently skipping any that don't exist (e.g. stderr when not kept
-// separate, or gesmsgend before the job finishes).
+// writeSpool renders the job's unified spool view to w: the sysmsg header
+// (its first HeaderLines lines), then the executable's captured output
+// (stdout, then stderr if kept separate), then the rest of sysmsg — the
+// end-of-job footer, appended once the job finishes. Missing files (e.g.
+// stderr when not kept separate, or the footer before the job finishes) are
+// silently skipped.
 func (j *Job) writeSpool(w io.Writer) error {
-	for _, name := range spoolFileOrder {
+	sysmsg, err := os.ReadFile(filepath.Join(j.Dir, "sysmsg"))
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	lines := strings.SplitAfter(string(sysmsg), "\n")
+	if n := len(lines); n > 0 && lines[n-1] == "" {
+		lines = lines[:n-1]
+	}
+	header, footer := lines, []string(nil)
+	if j.HeaderLines < len(lines) {
+		header, footer = lines[:j.HeaderLines], lines[j.HeaderLines:]
+	}
+
+	if _, err := io.WriteString(w, strings.Join(header, "")); err != nil {
+		return err
+	}
+
+	for _, name := range []string{"stdout", "stderr"} {
 		f, err := os.Open(filepath.Join(j.Dir, name))
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -126,7 +165,9 @@ func (j *Job) writeSpool(w io.Writer) error {
 			return err
 		}
 	}
-	return nil
+
+	_, err = io.WriteString(w, strings.Join(footer, ""))
+	return err
 }
 
 // ExitCode reports the job's recorded exit code, from the "exit=" field of
@@ -134,6 +175,16 @@ func (j *Job) writeSpool(w io.Writer) error {
 // yet.
 func (j *Job) ExitCode() (int, bool) {
 	return j.Exit, j.Finished
+}
+
+// HasTag reports whether the job was submitted with the given tag.
+func (j *Job) HasTag(tag string) bool {
+	for _, t := range j.Tags {
+		if t == tag {
+			return true
+		}
+	}
+	return false
 }
 
 // Running reports whether the job's recorded PID is still alive.

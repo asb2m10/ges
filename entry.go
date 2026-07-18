@@ -20,6 +20,15 @@ type EntryConfig struct {
 	// Name is the "entry-name" override, if present. When set it replaces the
 	// executable/script base name as the registered entry name.
 	Name string
+	// Tags are the comma-separated values of the "tags" directive, if
+	// present. They are recorded on the entry and copied onto every job
+	// submitted from it, so jobs can later be purged by tag (see
+	// Workspace.cmdPurgeTag).
+	Tags []string
+	// DDs are the ddnames from each "dd" directive, in the order they
+	// appeared. Each one links a file of the same name, sitting alongside the
+	// script, into the job's environment as DD_<DDNAME> (see ddEnvVar).
+	DDs []string
 	// Directives keeps every parsed key/value directive (including entry-name),
 	// in the order they appeared.
 	Directives [][2]string
@@ -73,8 +82,13 @@ func parseEntryConfig(path string) (*EntryConfig, error) {
 				continue
 			}
 			cfg.Directives = append(cfg.Directives, [2]string{key, value})
-			if key == "entry-name" {
+			switch key {
+			case "entry-name":
 				cfg.Name = value
+			case "tags":
+				cfg.Tags = splitTags(value)
+			case "dd":
+				cfg.DDs = append(cfg.DDs, value)
 			}
 		case trimmed == "" || strings.HasPrefix(trimmed, "#"):
 			// Blank or an ordinary comment inside the block: keep scanning.
@@ -84,6 +98,18 @@ func parseEntryConfig(path string) (*EntryConfig, error) {
 		}
 	}
 	return cfg, sc.Err()
+}
+
+// splitTags parses a comma-separated "tags" directive value into its
+// individual, trimmed tag names, dropping empty entries.
+func splitTags(value string) []string {
+	var tags []string
+	for _, t := range strings.Split(value, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			tags = append(tags, t)
+		}
+	}
+	return tags
 }
 
 // splitDirective turns "### <key> <value>" into its key and value parts.
@@ -152,6 +178,58 @@ func (w *Workspace) resolveEntry(name string) (string, error) {
 		return entryDirTarget(path)
 	}
 	return "", fmt.Errorf("invalid entry %q", name)
+}
+
+// resolveEntryTags returns the tags recorded for a registered entry, read
+// back from its "tags" directive in the entry's spec file. Plain
+// symlink entries (no configuration block) have none.
+func (w *Workspace) resolveEntryTags(name string) []string {
+	data, err := os.ReadFile(filepath.Join(w.EntryLink(name), "spec"))
+	if err != nil {
+		return nil
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if ok && key == "tags" {
+			return splitTags(value)
+		}
+	}
+	return nil
+}
+
+// resolveEntryDDs returns the ddnames recorded for a registered entry, read
+// back from its "dd" directives in the entry's spec file. Plain symlink
+// entries (no configuration block) have none.
+func (w *Workspace) resolveEntryDDs(name string) []string {
+	data, err := os.ReadFile(filepath.Join(w.EntryLink(name), "spec"))
+	if err != nil {
+		return nil
+	}
+	var dds []string
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if ok && key == "dd" {
+			dds = append(dds, value)
+		}
+	}
+	return dds
+}
+
+// ddEnvVar turns a ddname into its "DD_<DDNAME>" environment variable name:
+// upper-cased, with any character that isn't a letter, digit, or underscore
+// replaced by an underscore.
+func ddEnvVar(ddname string) string {
+	var b strings.Builder
+	b.WriteString("DD_")
+	for _, r := range strings.ToUpper(ddname) {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
 }
 
 // entryDirTarget finds the target of a directory-style entry by reading the
